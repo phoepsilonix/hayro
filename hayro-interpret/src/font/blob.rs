@@ -142,7 +142,11 @@ impl CffFontBlob {
     }
 
     pub(crate) fn glyph_index_by_cid(&self, cid: u16) -> Option<GlyphId> {
-        self.charset()?.glyph_id(Sid::new(cid)).ok()
+        let gid = self.charset()?.glyph_id(Sid::new(cid)).ok()?;
+        // For a CID that is not part of the charset, the lookup can run past the real
+        // ranges into the bytes following the charset and return a bogus glyph ID, so
+        // anything outside of the glyph range counts as not found.
+        (gid.to_u32() < self.num_glyphs()).then_some(gid)
     }
 
     pub(crate) fn glyph_index(&self, code: u8) -> Option<GlyphId> {
@@ -235,6 +239,16 @@ impl OpenTypeFontBlob {
 
     pub(crate) fn font_data(&self) -> FontData {
         self.yoke.backing_cart().clone()
+    }
+
+    /// Map a CID to a glyph ID via the charset of a CID-keyed CFF table.
+    ///
+    /// Returns `None` if the font has no CFF table or the CFF font is not CID-keyed
+    /// (in which case CIDs are glyph IDs already). A CID that is missing from the
+    /// charset maps to `.notdef`, like in the bare CFF case.
+    pub(crate) fn glyph_index_by_cid(&self, cid: u16) -> Option<GlyphId> {
+        let cff = self.cff_blob.as_ref().filter(|c| c.is_cid())?;
+        Some(cff.glyph_index_by_cid(cid).unwrap_or(GlyphId::NOTDEF))
     }
 
     pub(crate) fn font_ref(&self) -> &FontRef<'_> {
@@ -332,4 +346,27 @@ struct CFFYoke<'a> {
     cff: Cff<'a>,
     charset: Option<Charset<'a>>,
     subfonts: Vec<Subfont>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A subset of Noto Sans CJK SC (SIL Open Font License 1.1): a CID-keyed CFF table in an
+    /// OpenType container whose charset only contains CIDs 728, 786.., 1244 and 1248 (GIDs
+    /// 1..=464), as embedded by Canva.
+    const CID_KEYED_OTF: &[u8] = include_bytes!("test_data/noto_sans_cjk_sc_cid_subset.otf");
+
+    #[test]
+    fn cid_keyed_cff_in_opentype_maps_cid_via_charset() {
+        let blob = OpenTypeFontBlob::new(Arc::new(CID_KEYED_OTF.to_vec()), 0).unwrap();
+        // CID 1248 is in the charset (GID 464).
+        assert_eq!(blob.glyph_index_by_cid(1248), Some(GlyphId::new(464)));
+        assert_eq!(blob.glyph_index_by_cid(728), Some(GlyphId::new(1)));
+        // CID 464 is not in the charset, so it must be `.notdef` and not the glyph whose
+        // glyph ID happens to be 464.
+        assert_eq!(blob.glyph_index_by_cid(464), Some(GlyphId::NOTDEF));
+        // Same for CIDs behind the last range of the charset.
+        assert_eq!(blob.glyph_index_by_cid(1249), Some(GlyphId::NOTDEF));
+    }
 }

@@ -174,7 +174,20 @@ impl Type0Font {
         // selected font has the right glyph order, and map via that.
 
         match &self.font_type {
-            FontType::OpenType(_) => self.cid_to_gid_map.map(cid as u16),
+            FontType::OpenType(t) => {
+                // A CFF table wrapped in an OpenType container may be CID-keyed, in which
+                // case the CID has to be looked up in its charset (just like for a bare CFF
+                // font below), and is not necessarily equal to the glyph ID. This is the
+                // case for subsetted fonts: CIDs that are missing from the charset must map
+                // to `.notdef` and not to whichever glyph happens to have that glyph ID.
+                if matches!(self.cid_to_gid_map, CidToGIdMap::Identity)
+                    && let Some(gid) = t.glyph_index_by_cid(cid as u16)
+                {
+                    gid
+                } else {
+                    self.cid_to_gid_map.map(cid as u16)
+                }
+            }
             FontType::Cff(c) => {
                 if c.is_cid() {
                     // Very confusing stuff going on here, see https://github.com/mozilla/pdf.js/pull/15563.
