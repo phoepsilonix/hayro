@@ -5,11 +5,16 @@ use std::f64::consts::SQRT_2;
 
 impl Renderer<'_> {
     pub(super) fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool) {
-        let threshold = if is_text { 0.25 } else { 1.0 };
+        let min_stroke_width = self.global.min_stroke_width;
+        let threshold = if is_text {
+            0.25_f32.min(min_stroke_width)
+        } else {
+            min_stroke_width
+        };
 
-        // Best-effort attempt to ensure a line width of at least 1.0, as required by the PDF
-        // specification. If we are stroking text, we reduce the threshold as it will otherwise
-        // lead to very bold-looking text at low resolutions.
+        // Best-effort attempt to ensure a line width of at least `min_stroke_width` (1.0 by
+        // default, as required by the PDF specification). If we are stroking text, we reduce the
+        // threshold as it will otherwise lead to very bold-looking text at low resolutions.
         let min_factor = max_factor(self.ctx.transform());
         let mut line_width = stroke_props.line_width.max(0.01 / min_factor);
         let transformed_width = line_width * min_factor;

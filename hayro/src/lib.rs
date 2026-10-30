@@ -74,6 +74,7 @@ pub(crate) struct GlobalState {
     outline_cache: Rc<RefCell<FxHashMap<u128, Rc<BezPath>>>>,
     scaler: Scaler,
     force_image_interpolation: bool,
+    min_stroke_width: f32,
 }
 
 impl GlobalState {
@@ -83,6 +84,12 @@ impl GlobalState {
             outline_cache: cache.outline_cache.clone(),
             scaler: Scaler::new(image::RESAMPLING_FUNCTION),
             force_image_interpolation: settings.force_image_interpolation,
+            // NaN や負数は 0 (= 太らせない) 扱いにする。
+            min_stroke_width: if settings.min_stroke_width > 0.0 {
+                settings.min_stroke_width
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -199,10 +206,30 @@ impl<'a> RenderCache<'a> {
 }
 
 /// Settings for rendering a page.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct RenderSettings {
     /// Whether all images should forcibly be rendered with bilinear interpolation.
     pub force_image_interpolation: bool,
+    /// The minimum device-space width (in pixels) of stroked paths.
+    ///
+    /// Strokes thinner than this are widened to exactly this width. The PDF specification asks
+    /// for a minimum of one device pixel, which is the default (`1.0`), but this makes very thin
+    /// hairlines (for example the outlines of vector illustrations) look much bolder than in
+    /// renderers that draw them with their real pixel coverage. Lower values keep such lines
+    /// closer to their true weight; `0.0` disables the widening entirely.
+    ///
+    /// Stroked text uses `min(0.25, min_stroke_width)`. Strokes inside patterns and Type3
+    /// glyphs are never widened.
+    pub min_stroke_width: f32,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            force_image_interpolation: false,
+            min_stroke_width: 1.0,
+        }
+    }
 }
 
 /// Settings for the output pixmap.
