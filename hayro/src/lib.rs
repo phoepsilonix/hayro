@@ -75,6 +75,12 @@ pub(crate) struct GlobalState {
     scaler: Scaler,
     force_image_interpolation: bool,
     min_stroke_width: f32,
+    min_text_stroke_width: f32,
+}
+
+/// NaN や負数は 0 (= 太らせない) 扱いにする。
+fn sanitize_width(w: f32) -> f32 {
+    if w > 0.0 { w } else { 0.0 }
 }
 
 impl GlobalState {
@@ -84,12 +90,8 @@ impl GlobalState {
             outline_cache: cache.outline_cache.clone(),
             scaler: Scaler::new(image::RESAMPLING_FUNCTION),
             force_image_interpolation: settings.force_image_interpolation,
-            // NaN や負数は 0 (= 太らせない) 扱いにする。
-            min_stroke_width: if settings.min_stroke_width > 0.0 {
-                settings.min_stroke_width
-            } else {
-                0.0
-            },
+            min_stroke_width: sanitize_width(settings.min_stroke_width),
+            min_text_stroke_width: sanitize_width(settings.min_text_stroke_width),
         }
     }
 }
@@ -218,9 +220,15 @@ pub struct RenderSettings {
     /// renderers that draw them with their real pixel coverage. Lower values keep such lines
     /// closer to their true weight; `0.0` disables the widening entirely.
     ///
-    /// Stroked text uses `min(0.25, min_stroke_width)`. Strokes inside patterns and Type3
-    /// glyphs are never widened.
+    /// Strokes inside patterns and Type3 glyphs are never widened. Stroked text uses
+    /// [`RenderSettings::min_text_stroke_width`] instead.
     pub min_stroke_width: f32,
+    /// The minimum device-space width (in pixels) of stroked text.
+    ///
+    /// Works like [`RenderSettings::min_stroke_width`], but only for stroked text. The default
+    /// is `0.25`, as text would otherwise look very bold at low resolutions. `0.0` disables the
+    /// widening entirely.
+    pub min_text_stroke_width: f32,
 }
 
 impl Default for RenderSettings {
@@ -228,6 +236,7 @@ impl Default for RenderSettings {
         Self {
             force_image_interpolation: false,
             min_stroke_width: 1.0,
+            min_text_stroke_width: 0.25,
         }
     }
 }
