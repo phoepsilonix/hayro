@@ -81,6 +81,11 @@ pub(crate) struct GlobalState {
     aliasing_threshold: Option<u8>,
     hinting: bool,
     glyph_caching: bool,
+    min_stroke_width: f32,
+}
+
+fn sanitize_width(width: f32) -> f32 {
+    if width > 0.0 { width } else { 0.0 }
 }
 
 impl GlobalState {
@@ -95,6 +100,7 @@ impl GlobalState {
             aliasing_threshold: settings.aliasing_threshold,
             hinting: settings.hinting,
             glyph_caching: settings.glyph_caching,
+            min_stroke_width: sanitize_width(settings.min_stroke_width),
         }
     }
 }
@@ -228,6 +234,8 @@ pub struct RenderSettings {
     pub hinting: bool,
     /// Whether rasterized glyphs should be cached and reused.
     pub glyph_caching: bool,
+    /// Minimum device-space width of strokes, in pixels (`0.0` disables widening).
+    pub min_stroke_width: f32,
 }
 
 impl Default for RenderSettings {
@@ -237,6 +245,7 @@ impl Default for RenderSettings {
             aliasing_threshold: None,
             hinting: true,
             glyph_caching: true,
+            min_stroke_width: 1.0,
         }
     }
 }
