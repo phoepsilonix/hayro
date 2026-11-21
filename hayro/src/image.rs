@@ -131,6 +131,26 @@ impl Renderer<'_> {
             return self.draw_image_with_alpha_mask(image_data, alpha_data.unwrap());
         }
 
+        // With `force_image_interpolation` (smooth, MuPDF/poppler-like photos), an axis-aligned
+        // downscale of an opaque image is resampled exactly once, straight to its integer device
+        // rectangle, and blitted without further filtering. The generic path below resizes to
+        // `ceil(size * scale)` first and then draws that result with bilinear sampling at a
+        // fractional offset and a slightly off scale, i.e. it resamples twice, which blurs photos.
+        if self.global.force_image_interpolation
+            && alpha_data.is_none()
+            && !self.in_type3_glyph
+            && matches!(
+                image_data,
+                RenderImageData::Rgb(_) | RenderImageData::Luma(_)
+            )
+            && x_scale < 1.0
+            && y_scale < 1.0
+            && let Some(rect) = snapped_downscale_rect(&cur_transform, img_width, img_height)
+        {
+            self.draw_image_snapped(image_data, rect);
+            return;
+        }
+
         let mut quality = if interpolate {
             ImageQuality::Medium
         } else {
@@ -394,6 +414,74 @@ impl Renderer<'_> {
         );
     }
 
+    /// Draws an opaque RGB/luma image resampled once to the integer device rectangle `rect`
+    /// (`x`, `y`, width, height), see `snapped_downscale_rect`.
+    fn draw_image_snapped(
+        &mut self,
+        image_data: RenderImageData,
+        (x, y, new_width, new_height): (i32, i32, u32, u32),
+    ) {
+        let (width, height) = (image_data.width(), image_data.height());
+        let same_size = new_width == width && new_height == height;
+
+        let rgba: Vec<u8> = match image_data {
+            RenderImageData::Rgb(rgb) => {
+                let data = if same_size {
+                    rgb.data
+                } else {
+                    resize_image_data(
+                        &self.global.scaler,
+                        rgb.data,
+                        width,
+                        height,
+                        new_width,
+                        new_height,
+                        ImagePixelFormat::Rgb,
+                    )
+                };
+                data.as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[0], p[1], p[2], 255])
+                    .collect()
+            }
+            RenderImageData::Luma(luma) => {
+                let data = if same_size {
+                    luma.data
+                } else {
+                    resize_image_data(
+                        &self.global.scaler,
+                        luma.data,
+                        width,
+                        height,
+                        new_width,
+                        new_height,
+                        ImagePixelFormat::Luma,
+                    )
+                };
+                data.iter().flat_map(|g| [*g, *g, *g, 255]).collect()
+            }
+            RenderImageData::Solid(_) => unreachable!(),
+        };
+
+        let pixmap = Pixmap::from_parts(
+            rgba,
+            new_width as u16,
+            new_height as u16,
+            PixelMetadata {
+                may_have_transparency: false,
+                ..Default::default()
+            },
+        );
+
+        // The pixmap lands exactly on whole device pixels, so nearest sampling is a plain copy.
+        self.draw_pixmap(
+            Arc::new(pixmap),
+            ImageQuality::Low,
+            Affine::translate((x as f64, y as f64)),
+        );
+    }
+
     fn draw_pixmap(&mut self, pixmap: Arc<Pixmap>, quality: ImageQuality, transform: Affine) {
         let (width, height) = (pixmap.width(), pixmap.height());
         let image = Image {
@@ -567,6 +655,42 @@ impl<S: Simd> Splat4thExt for u8x32<S> {
         ]
         .simd_into(self.simd)
     }
+}
+
+/// The integer device rectangle `(x, y, width, height)` an axis-aligned, upright (no rotation,
+/// skew or flip) image with pixel size `width`x`height` covers under `transform`, with the edges
+/// rounded to the nearest device pixel. Neighbouring images that share an edge keep sharing it.
+/// `None` for anything else (or if the result would be unreasonably large).
+fn snapped_downscale_rect(
+    transform: &Affine,
+    width: u32,
+    height: u32,
+) -> Option<(i32, i32, u32, u32)> {
+    let [a, b, c, d, e, f] = transform.as_coeffs();
+    let tolerance = 1e-4 * a.abs().max(d.abs());
+    if !(a > 0.0 && d > 0.0 && b.abs() <= tolerance && c.abs() <= tolerance) {
+        return None;
+    }
+    if !(e.is_finite() && f.is_finite() && e.abs() < 1e8 && f.abs() < 1e8) {
+        return None;
+    }
+
+    let x0 = e.round();
+    let y0 = f.round();
+    let x1 = (e + a * width as f64).round().max(x0 + 1.0);
+    let y1 = (f + d * height as f64).round().max(y0 + 1.0);
+    let (new_width, new_height) = (x1 - x0, y1 - y0);
+
+    let limit = (u16::MAX / 2) as f64;
+    if new_width > limit
+        || new_height > limit
+        || new_width > width as f64
+        || new_height > height as f64
+    {
+        return None;
+    }
+
+    Some((x0 as i32, y0 as i32, new_width as u32, new_height as u32))
 }
 
 fn resize_image_data(
