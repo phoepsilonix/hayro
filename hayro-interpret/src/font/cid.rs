@@ -183,7 +183,19 @@ impl Type0Font {
                 if matches!(self.cid_to_gid_map, CidToGIdMap::Identity)
                     && let Some(gid) = t.glyph_index_by_cid(cid as u16)
                 {
-                    gid
+                    // Some producers (Canva, for example) write glyph IDs instead of CIDs into
+                    // the content stream for such fonts. Browsers draw those glyphs, so for a
+                    // code whose CID is not in the charset, but whose `ToUnicode` entry names a
+                    // character the font's `cmap` has a glyph for, use that glyph instead of
+                    // `.notdef`. Codes that are found in the charset are never affected.
+                    if gid == GlyphId::NOTDEF
+                        && let Some(glyph) = self.map_via_unicode(to_unicode_key)
+                        && glyph != GlyphId::NOTDEF
+                    {
+                        glyph
+                    } else {
+                        gid
+                    }
                 } else {
                     self.cid_to_gid_map.map(cid as u16)
                 }
