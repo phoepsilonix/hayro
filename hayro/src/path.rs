@@ -8,7 +8,7 @@ const MIN_DASH_PERIOD: f32 = 0.1;
 impl Renderer<'_> {
     pub(super) fn set_stroke_properties(&mut self, stroke_props: &StrokeProps, is_text: bool) {
         let threshold = if is_text {
-            0.25_f32.min(self.global.min_stroke_width)
+            self.global.min_text_stroke_width
         } else {
             self.global.min_stroke_width
         };
