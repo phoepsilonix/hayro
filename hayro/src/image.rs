@@ -141,10 +141,12 @@ impl Renderer<'_> {
         }
 
         // With `force_image_interpolation` (smooth, MuPDF/poppler-like photos), an axis-aligned
-        // downscale of an opaque image is resampled exactly once, straight to its integer device
-        // rectangle, and blitted without further filtering. The generic path below resizes to
-        // `ceil(size * scale)` first and then draws that result with bilinear sampling at a
-        // fractional offset and a slightly off scale, i.e. it resamples twice, which blurs photos.
+        // downscale of an opaque image is resampled exactly once, straight to the device pixels it
+        // covers, at its exact (sub-pixel) position, like MuPDF's `fz_scale_pixmap`. The generic
+        // path below resizes to `ceil(size * scale)` first and then draws that result with
+        // bilinear sampling at a fractional offset and a slightly off scale, i.e. it resamples
+        // twice, which blurs photos. Edge pixels get partial alpha, so the image keeps its exact
+        // geometry (no snapping to the pixel grid).
         if self.global.force_image_interpolation
             && alpha_data.is_none()
             && !self.in_type3_glyph
@@ -154,9 +156,9 @@ impl Renderer<'_> {
             )
             && x_scale < 1.0
             && y_scale < 1.0
-            && let Some(rect) = snapped_downscale_rect(&cur_transform, img_width, img_height)
+            && let Some(geometry) = exact_downscale_geometry(&cur_transform, img_width, img_height)
         {
-            self.draw_image_snapped(image_data, rect);
+            self.draw_image_exact(image_data, &geometry);
             return;
         }
 
@@ -430,62 +432,27 @@ impl Renderer<'_> {
         );
     }
 
-    /// Draws an opaque RGB/luma image resampled once to the integer device rectangle `rect`
-    /// (`x`, `y`, width, height), see `snapped_downscale_rect`.
-    fn draw_image_snapped(
-        &mut self,
-        image_data: RenderImageData,
-        (x, y, new_width, new_height): (i32, i32, u32, u32),
-    ) {
-        let (width, height) = (image_data.width(), image_data.height());
-        let same_size = new_width == width && new_height == height;
+    /// Draws an opaque RGB/luma image resampled once to the device pixels it covers, keeping its
+    /// exact sub-pixel position and size, see `exact_downscale_geometry`.
+    fn draw_image_exact(&mut self, image_data: RenderImageData, geometry: &DownscaleGeometry) {
+        let (width, height) = (image_data.width() as usize, image_data.height() as usize);
 
-        let rgba: Vec<u8> = match image_data {
+        let rgba = match image_data {
             RenderImageData::Rgb(rgb) => {
-                let data = if same_size {
-                    rgb.data
-                } else {
-                    resize_image_data(
-                        &self.global.scaler,
-                        rgb.data,
-                        width,
-                        height,
-                        new_width,
-                        new_height,
-                        ImagePixelFormat::Rgb,
-                    )
-                };
-                data.as_chunks::<3>()
-                    .0
-                    .iter()
-                    .flat_map(|p| [p[0], p[1], p[2], 255])
-                    .collect()
+                resample_premultiplied::<3>(&rgb.data, width, height, geometry)
             }
             RenderImageData::Luma(luma) => {
-                let data = if same_size {
-                    luma.data
-                } else {
-                    resize_image_data(
-                        &self.global.scaler,
-                        luma.data,
-                        width,
-                        height,
-                        new_width,
-                        new_height,
-                        ImagePixelFormat::Luma,
-                    )
-                };
-                data.iter().flat_map(|g| [*g, *g, *g, 255]).collect()
+                resample_premultiplied::<1>(&luma.data, width, height, geometry)
             }
             RenderImageData::Solid(_) => unreachable!(),
         };
 
         let pixmap = Pixmap::from_parts(
             rgba,
-            new_width as u16,
-            new_height as u16,
+            geometry.width as u16,
+            geometry.height as u16,
             PixelMetadata {
-                may_have_transparency: false,
+                may_have_transparency: true,
                 ..Default::default()
             },
         );
@@ -494,7 +461,7 @@ impl Renderer<'_> {
         self.draw_pixmap(
             Arc::new(pixmap),
             ImageQuality::Low,
-            Affine::translate((x as f64, y as f64)),
+            Affine::translate((geometry.x as f64, geometry.y as f64)),
         );
     }
 
@@ -672,40 +639,172 @@ impl<S: Simd> Splat4thExt for u8x32<S> {
     }
 }
 
-/// The integer device rectangle `(x, y, width, height)` an axis-aligned, upright (no rotation,
-/// skew or flip) image with pixel size `width`x`height` covers under `transform`, with the edges
-/// rounded to the nearest device pixel. Neighbouring images that share an edge keep sharing it.
-/// `None` for anything else (or if the result would be unreasonably large).
-fn snapped_downscale_rect(
+/// Where an axis-aligned, upright (no rotation, skew or flip) image that is scaled down in both
+/// directions lands on the device pixel grid.
+struct DownscaleGeometry {
+    /// The device pixel of the top-left corner of the output.
+    x: i32,
+    y: i32,
+    /// The output size in device pixels: the image rectangle expanded to whole pixels.
+    width: u32,
+    height: u32,
+    /// The sub-pixel offset (`0 <= offset < 1`) of the image's top-left corner inside the output.
+    x_offset: f64,
+    y_offset: f64,
+    /// Device pixels per image pixel (`< 1`).
+    x_scale: f64,
+    y_scale: f64,
+}
+
+fn exact_downscale_geometry(
     transform: &Affine,
     width: u32,
     height: u32,
-) -> Option<(i32, i32, u32, u32)> {
+) -> Option<DownscaleGeometry> {
     let [a, b, c, d, e, f] = transform.as_coeffs();
     let tolerance = 1e-4 * a.abs().max(d.abs());
-    if !(a > 0.0 && d > 0.0 && b.abs() <= tolerance && c.abs() <= tolerance) {
+    let upright_downscale = a > 0.0 && d > 0.0 && a < 1.0 && d < 1.0;
+    if !(upright_downscale && b.abs() <= tolerance && c.abs() <= tolerance) {
         return None;
     }
     if !(e.is_finite() && f.is_finite() && e.abs() < 1e8 && f.abs() < 1e8) {
         return None;
     }
 
-    let x0 = e.round();
-    let y0 = f.round();
-    let x1 = (e + a * width as f64).round().max(x0 + 1.0);
-    let y1 = (f + d * height as f64).round().max(y0 + 1.0);
-    let (new_width, new_height) = (x1 - x0, y1 - y0);
+    let (x, y) = (e.floor(), f.floor());
+    let (x_offset, y_offset) = (e - x, f - y);
+    let out_width = (x_offset + a * width as f64).ceil().max(1.0);
+    let out_height = (y_offset + d * height as f64).ceil().max(1.0);
 
     let limit = (u16::MAX / 2) as f64;
-    if new_width > limit
-        || new_height > limit
-        || new_width > width as f64
-        || new_height > height as f64
-    {
+    if out_width > limit || out_height > limit {
         return None;
     }
 
-    Some((x0 as i32, y0 as i32, new_width as u32, new_height as u32))
+    Some(DownscaleGeometry {
+        x: x as i32,
+        y: y as i32,
+        width: out_width as u32,
+        height: out_height as u32,
+        x_offset,
+        y_offset,
+        x_scale: a,
+        y_scale: d,
+    })
+}
+
+struct AxisWeights {
+    /// The first source sample the weights apply to.
+    start: usize,
+    /// Normalized weights; they sum to the coverage, which is below 1 at the image's edges.
+    weights: Vec<f32>,
+    /// How much of the output pixel is covered by the image.
+    coverage: f32,
+}
+
+/// The weights to resample `len` source samples, which map to the output pixels starting at
+/// `offset` (`0 <= offset < 1`) with `scale < 1` output pixels per sample, to `out_len` output
+/// pixels. The filter is the same smoothstep one MuPDF's `fz_scale_pixmap` uses, stretched to
+/// one output pixel on each side. The source counts as transparent beyond its edges, so output
+/// pixels that are only partly covered get a coverage below 1.
+fn axis_weights(len: usize, scale: f64, offset: f64, out_len: usize) -> Vec<AxisWeights> {
+    (0..out_len)
+        .map(|j| {
+            let center = j as f64 + 0.5;
+            let first = ((center - 1.0 - offset) / scale - 0.5).floor() as i64;
+            let last = ((center + 1.0 - offset) / scale - 0.5).ceil() as i64;
+            let kernel = |i: i64| {
+                let u = (center - (offset + (i as f64 + 0.5) * scale)).abs();
+                if u >= 1.0 {
+                    0.0
+                } else {
+                    1.0 + (2.0 * u - 3.0) * u * u
+                }
+            };
+
+            let total: f64 = (first..=last).map(|i| kernel(i)).sum();
+            let lo = first.max(0);
+            let hi = last.min(len as i64 - 1);
+            if total <= 0.0 || lo > hi {
+                return AxisWeights {
+                    start: 0,
+                    weights: vec![],
+                    coverage: 0.0,
+                };
+            }
+
+            let weights = (lo..=hi)
+                .map(|i| (kernel(i) / total) as f32)
+                .collect::<Vec<_>>();
+            let coverage = weights.iter().sum::<f32>();
+
+            AxisWeights {
+                start: lo as usize,
+                weights,
+                coverage,
+            }
+        })
+        .collect()
+}
+
+/// Resamples `data` (`N` = 1 for luma, 3 for RGB, 8 bits per channel, opaque) once, as described
+/// by `geometry`, into premultiplied RGBA.
+fn resample_premultiplied<const N: usize>(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    geometry: &DownscaleGeometry,
+) -> Vec<u8> {
+    let (out_width, out_height) = (geometry.width as usize, geometry.height as usize);
+    let x_weights = axis_weights(width, geometry.x_scale, geometry.x_offset, out_width);
+    let y_weights = axis_weights(height, geometry.y_scale, geometry.y_offset, out_height);
+
+    // Horizontal pass.
+    let mut temp = vec![0f32; height * out_width * N];
+    for (row, out_row) in data
+        .chunks_exact(width * N)
+        .zip(temp.chunks_exact_mut(out_width * N))
+    {
+        for (weights, out) in x_weights.iter().zip(out_row.chunks_exact_mut(N)) {
+            let mut acc = [0f32; N];
+            for (k, weight) in weights.weights.iter().enumerate() {
+                let pixel = &row[(weights.start + k) * N..][..N];
+                for (acc, sample) in acc.iter_mut().zip(pixel) {
+                    *acc += weight * *sample as f32;
+                }
+            }
+            out.copy_from_slice(&acc);
+        }
+    }
+
+    // Vertical pass. The colors are weighted by the coverage, i.e. already premultiplied.
+    let mut out = vec![0u8; out_width * out_height * 4];
+    let mut acc = vec![0f32; out_width * N];
+    for (weights, out_row) in y_weights.iter().zip(out.chunks_exact_mut(out_width * 4)) {
+        acc.fill(0.0);
+        for (m, weight) in weights.weights.iter().enumerate() {
+            let source = &temp[(weights.start + m) * out_width * N..][..out_width * N];
+            for (acc, sample) in acc.iter_mut().zip(source) {
+                *acc += weight * sample;
+            }
+        }
+
+        for ((pixel, x_weights), color) in out_row
+            .chunks_exact_mut(4)
+            .zip(&x_weights)
+            .zip(acc.chunks_exact(N))
+        {
+            let coverage = (x_weights.coverage * weights.coverage).clamp(0.0, 1.0);
+            let alpha = (coverage * 255.0 + 0.5) as u8;
+            for (channel, out) in pixel[..3].iter_mut().enumerate() {
+                let value = color[if N == 1 { 0 } else { channel }];
+                *out = ((value.max(0.0) + 0.5) as u32).min(alpha as u32) as u8;
+            }
+            pixel[3] = alpha;
+        }
+    }
+
+    out
 }
 
 fn resize_image_data(
